@@ -207,7 +207,7 @@ def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None,
     }'''
     variables = {'owner_affiliation': owner_affiliation, 'login': USER_NAME, 'cursor': cursor}
     request = simple_request(loc_query.__name__, query, variables)
-    current_edges = [edge for edge in request.json()['data']['user']['repositories']['edges'] if edge.get('node') and edge['node'].get('nameWithOwner')]
+    current_edges = [edge for edge in request.json()['data']['user']['repositories']['edges'] if edge and edge.get('node') and edge['node'].get('nameWithOwner')]
     if request.json()['data']['user']['repositories']['pageInfo']['hasNextPage']:
         edges += current_edges
         return loc_query(owner_affiliation, comment_size, force_cache, request.json()['data']['user']['repositories']['pageInfo']['endCursor'], edges)
