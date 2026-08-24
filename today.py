@@ -13,6 +13,9 @@ HEADERS = {'authorization': 'token '+ os.environ['ACCESS_TOKEN']}
 USER_NAME = os.environ['USER_NAME'] # 'shawnsony07'
 QUERY_COUNT = {'user_getter': 0, 'follower_getter': 0, 'graph_repos_stars': 0, 'recursive_loc': 0, 'graph_commits': 0, 'loc_query': 0}
 
+MAX_RETRIES = 5
+RETRYABLE_STATUS = (502, 503, 504)
+
 
 def daily_readme(birthday):
     """
@@ -42,11 +45,17 @@ def format_plural(unit):
 def simple_request(func_name, query, variables):
     """
     Returns a request, or raises an Exception if the response does not succeed.
+    Retries on transient gateway errors (502/503/504) with exponential backoff.
     """
-    request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS)
-    if request.status_code == 200:
-        return request
-    raise Exception(func_name, ' has failed with a', request.status_code, request.text, QUERY_COUNT)
+    for attempt in range(MAX_RETRIES):
+        request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS)
+        if request.status_code == 200:
+            return request
+        if request.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
+            time.sleep(2 ** attempt)
+            continue
+        raise Exception(func_name, ' has failed with a', request.status_code, request.text, QUERY_COUNT)
+    raise Exception(func_name, ' has failed after retries', QUERY_COUNT)
 
 
 def graph_commits(start_date, end_date):
@@ -107,9 +116,10 @@ def graph_repos_stars(count_type, owner_affiliation, cursor=None, add_loc=0, del
 
 def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, deletion_total=0, my_commits=0, cursor=None):
     """
-    Uses GitHub's GraphQL v4 API and cursor pagination to fetch 100 commits from a repository at a time
+    Uses GitHub's GraphQL v4 API and cursor pagination to fetch 100 commits from a repository at a time.
+    Iterative (not recursive) so it can page through repos with unlimited commit history
+    without hitting Python's recursion limit. Retries transient gateway errors.
     """
-    query_count('recursive_loc')
     query = '''
     query ($repo_name: String!, $owner: String!, $cursor: String) {
         repository(name: $repo_name, owner: $owner) {
@@ -142,48 +152,53 @@ def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, delet
             }
         }
     }'''
-    variables = {'repo_name': repo_name, 'owner': owner, 'cursor': cursor}
-    max_retries = 5
-    for attempt in range(max_retries):
-        request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS)
-        if request.status_code == 200:
-            if request.json()['data']['repository']['defaultBranchRef'] != None:
-                return loc_counter_one_repo(owner, repo_name, data, cache_comment, request.json()['data']['repository']['defaultBranchRef']['target']['history'], addition_total, deletion_total, my_commits)
-            else: return 0
-        if request.status_code == 403:
+
+    while True:
+        query_count('recursive_loc')
+        variables = {'repo_name': repo_name, 'owner': owner, 'cursor': cursor}
+
+        request = None
+        for attempt in range(MAX_RETRIES):
+            request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS)
+            if request.status_code == 200:
+                break
+            if request.status_code == 403:
+                force_close_file(data, cache_comment)
+                raise Exception('Too many requests in a short amount of time!\nYou\'ve hit the non-documented anti-abuse limit!')
+            if request.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
+                continue
             force_close_file(data, cache_comment)
-            raise Exception('Too many requests in a short amount of time!\nYou\'ve hit the non-documented anti-abuse limit!')
-        if request.status_code in (502, 503, 504) and attempt < max_retries - 1:
-            time.sleep(2 ** attempt)
-            continue
-        force_close_file(data, cache_comment)
-        raise Exception('recursive_loc() has failed with a', request.status_code, request.text, QUERY_COUNT)
+            raise Exception('recursive_loc() has failed with a', request.status_code, request.text, QUERY_COUNT)
+
+        default_branch = request.json()['data']['repository']['defaultBranchRef']
+        if default_branch is None:
+            return addition_total, deletion_total, my_commits
+
+        history = default_branch['target']['history']
+        for node in history['edges']:
+            if node['node']['author']['user'] == OWNER_ID:
+                my_commits += 1
+                addition_total += node['node']['additions']
+                deletion_total += node['node']['deletions']
+
+        if history['edges'] == [] or not history['pageInfo']['hasNextPage']:
+            return addition_total, deletion_total, my_commits
+
+        cursor = history['pageInfo']['endCursor']
 
 
-def loc_counter_one_repo(owner, repo_name, data, cache_comment, history, addition_total, deletion_total, my_commits):
-    """
-    Recursively call recursive_loc (since GraphQL can only search 100 commits at a time) 
-    only adds the LOC value of commits authored by me
-    """
-    for node in history['edges']:
-        if node['node']['author']['user'] == OWNER_ID:
-            my_commits += 1
-            addition_total += node['node']['additions']
-            deletion_total += node['node']['deletions']
-
-    if history['edges'] == [] or not history['pageInfo']['hasNextPage']:
-        return addition_total, deletion_total, my_commits
-    else: return recursive_loc(owner, repo_name, data, cache_comment, addition_total, deletion_total, my_commits, history['pageInfo']['endCursor'])
-
-
-def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None, edges=[]):
+def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None, edges=None):
     """
     Uses GitHub's GraphQL v4 API to query all the repositories I have access to (with respect to owner_affiliation)
     Queries 60 repos at a time, because larger queries give a 502 timeout error and smaller queries send too many
     requests and also give a 502 error.
+    Iterative (not recursive) so accounts with many repo pages can't hit the recursion limit.
     Returns the total number of lines of code in all repositories
     """
-    query_count('loc_query')
+    if edges is None:
+        edges = []
+
     query = '''
     query ($owner_affiliation: [RepositoryAffiliation], $login: String!, $cursor: String) {
         user(login: $login) {
@@ -211,14 +226,20 @@ def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None,
             }
         }
     }'''
-    variables = {'owner_affiliation': owner_affiliation, 'login': USER_NAME, 'cursor': cursor}
-    request = simple_request(loc_query.__name__, query, variables)
-    current_edges = [edge for edge in request.json()['data']['user']['repositories']['edges'] if edge and edge.get('node') and edge['node'].get('nameWithOwner')]
-    if request.json()['data']['user']['repositories']['pageInfo']['hasNextPage']:
+
+    while True:
+        query_count('loc_query')
+        variables = {'owner_affiliation': owner_affiliation, 'login': USER_NAME, 'cursor': cursor}
+        request = simple_request(loc_query.__name__, query, variables)
+        payload = request.json()['data']['user']['repositories']
+        current_edges = [edge for edge in payload['edges'] if edge and edge.get('node') and edge['node'].get('nameWithOwner')]
         edges += current_edges
-        return loc_query(owner_affiliation, comment_size, force_cache, request.json()['data']['user']['repositories']['pageInfo']['endCursor'], edges)
-    else:
-        return cache_builder(edges + current_edges, comment_size, force_cache)
+
+        if payload['pageInfo']['hasNextPage']:
+            cursor = payload['pageInfo']['endCursor']
+            continue
+
+        return cache_builder(edges, comment_size, force_cache)
 
 
 def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0):
